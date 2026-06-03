@@ -7,6 +7,7 @@ Le meilleur modèle (val accuracy) est sauvegardé automatiquement.
 
 import json
 import logging
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.utils.class_weight import compute_class_weight
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 
 from data.preprocessing import augment_sample, build_feature_vector
@@ -24,14 +26,37 @@ logger = logging.getLogger(__name__)
 
 # --- Constantes ---
 BATCH_SIZE: int = 32
-N_EPOCHS: int = 50
+N_EPOCHS: int = 100
 LR: float = 1e-3
-DROPOUT: float = 0.3   # utilisé par LSFClassifier, rappelé ici pour cohérence
+WEIGHT_DECAY: float = 1e-4   # L2 régularisation — réduit l'overfit sur petit dataset
+LABEL_SMOOTHING: float = 0.1  # empêche la sur-confiance, utile avec classes rares
+WARMUP_EPOCHS: int = 5        # rampe LR linéaire avant le cosinus
+DROPOUT: float = 0.4
 
-# Seuil de classes sous-représentées : n_augments plus agressif en dessous
-_SMALL_CLASS_THRESHOLD: int = 10
-_N_AUGMENTS_SMALL: int = 8
-_N_AUGMENTS_NORMAL: int = 3
+# Plafond d'augmentation pour les classes très rares (1-3 samples).
+# Au-delà, les variantes sont trop similaires et l'overfit empire.
+_N_AUGMENTS_MAX: int = 12
+
+
+def _compute_n_augments(count: int, target: int) -> int:
+    """
+    Calcule le nombre d'augmentations pour une classe à partir de son count.
+
+    Cible : count * (n_augments + 1) ≈ target (classe la plus représentée).
+    Plafonné à _N_AUGMENTS_MAX pour éviter l'overfit sur les classes isolées.
+
+    Exemples avec target=51 :
+        count=1  → 12 (plafonné)   →  13 samples
+        count=3  → 12 (plafonné)   →  36 samples
+        count=5  → 9              →  50 samples
+        count=10 → 4              →  50 samples
+        count=20 → 2              →  60 samples
+        count=50 → 0              →  50 samples
+    """
+    if count >= target:
+        return 0
+    n_aug = round(target / count) - 1
+    return max(0, min(n_aug, _N_AUGMENTS_MAX))
 
 
 # ---------------------------------------------------------------------------
@@ -95,20 +120,23 @@ def make_dataloaders(
     # Distribution des classes dans le train pour calibrer l'augmentation
     train_class_counts: Counter = Counter(s["label_idx"] for s in train_samples)
 
+    # Cible d'équilibrage = count de la classe la plus représentée dans le train
+    target_per_class: int = max(train_class_counts.values()) if train_class_counts else 1
+
     idx_to_slug = {v: k for k, v in label_map.items()}
     logger.info("Split : %d train / %d val samples (avant augmentation)", len(train_samples), len(val_samples))
-    logger.info("Distribution train par classe :")
-    for idx, count in sorted(train_class_counts.items()):
+    logger.info("Distribution train (cible=%d samples/classe) :", target_per_class)
+    for idx, count in sorted(train_class_counts.items(), key=lambda x: x[1]):
         slug = idx_to_slug.get(idx, str(idx))
-        n_aug = _N_AUGMENTS_SMALL if count < _SMALL_CLASS_THRESHOLD else _N_AUGMENTS_NORMAL
-        logger.info("  %-20s : %2d samples → ×%d (total %d)", slug, count, n_aug + 1, count * (n_aug + 1))
+        n_aug = _compute_n_augments(count, target_per_class)
+        logger.info("  %-22s : %2d → ×%-2d = %d", slug, count, n_aug + 1, count * (n_aug + 1))
 
-    # Construction des features train avec augmentation
+    # Construction des features train avec augmentation pondérée par classe
     train_X: list[np.ndarray] = []
     train_y: list[int] = []
     for s in train_samples:
         count = train_class_counts[s["label_idx"]]
-        n_aug = _N_AUGMENTS_SMALL if count < _SMALL_CLASS_THRESHOLD else _N_AUGMENTS_NORMAL
+        n_aug = _compute_n_augments(count, target_per_class)
 
         # augment_sample retourne [original] + n_aug variantes (toutes en (64, 318))
         variants = augment_sample(s["frames"], n_augments=n_aug)
@@ -265,7 +293,47 @@ def eval_epoch(
 
 
 # ---------------------------------------------------------------------------
-# 5. train
+# 5. _log_per_class_accuracy  (interne)
+# ---------------------------------------------------------------------------
+
+def _log_per_class_accuracy(
+    model: nn.Module,
+    loader: DataLoader,
+    label_map: dict[str, int],
+    device: torch.device,
+) -> None:
+    """
+    Calcule et logue la précision par classe sur un DataLoader.
+    Appelée une fois après l'entraînement sur le meilleur checkpoint.
+    """
+    model.eval()
+    correct: Counter = Counter()
+    total: Counter = Counter()
+
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device)
+            preds = model(X_batch).argmax(dim=1).cpu().numpy()
+            for true_idx, pred_idx in zip(y_batch.numpy(), preds):
+                total[int(true_idx)] += 1
+                if true_idx == pred_idx:
+                    correct[int(true_idx)] += 1
+
+    idx_to_slug = {v: k for k, v in label_map.items()}
+    logger.info("─── Précision par classe (meilleur modèle, val) ───")
+    for idx in sorted(total.keys()):
+        slug = idx_to_slug.get(idx, str(idx))
+        acc = correct[idx] / total[idx] if total[idx] > 0 else 0.0
+        bar = "#" * int(acc * 12) + "." * (12 - int(acc * 12))
+        logger.info(
+            "  %-22s [%s] %3.0f%%  (%d/%d)",
+            slug, bar, acc * 100, correct[idx], total[idx],
+        )
+    logger.info("─" * 52)
+
+
+# ---------------------------------------------------------------------------
+# 6. train
 # ---------------------------------------------------------------------------
 
 def train(
@@ -298,14 +366,23 @@ def train(
     # --- Dataloaders ---
     train_loader, val_loader = make_dataloaders(samples, label_map)
 
-    # --- Modèle et optimiseur ---
+    # --- Modèle, optimiseur et scheduler ---
     model = make_classifier(n_classes=n_classes).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
 
-    # --- Loss avec class weights (calculés sur les labels train augmentés) ---
+    # Warmup linéaire (lr/10 → lr) puis cosinus (lr → eta_min).
+    # Le warmup évite les grands gradients en début d'entraînement quand les
+    # poids sont encore aléatoires.
+    warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=WARMUP_EPOCHS)
+    cosine = CosineAnnealingLR(optimizer, T_max=max(1, n_epochs - WARMUP_EPOCHS), eta_min=1e-5)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[WARMUP_EPOCHS])
+
+    # --- Loss avec class weights + label smoothing ---
+    # label_smoothing=0.1 : distribue 10% de la probabilité sur les autres classes,
+    # évite que le modèle soit trop sûr de lui sur les classes rares sur-augmentées.
     train_labels = [int(y) for _, ys in train_loader for y in ys]
     class_weights = compute_class_weights(train_labels, n_classes).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
 
     logger.info("Modèle : %d paramètres", sum(p.numel() for p in model.parameters()))
     logger.info("Début entraînement : %d epochs, lr=%.4f, device=%s", n_epochs, lr, device)
@@ -315,10 +392,12 @@ def train(
     for epoch in range(1, n_epochs + 1):
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, val_acc = eval_epoch(model, val_loader, criterion, device)
+        scheduler.step()
 
         logger.info(
-            "Epoch %3d/%d — train_loss=%.4f | val_loss=%.4f | val_acc=%.2f%%",
+            "Epoch %3d/%d — train_loss=%.4f | val_loss=%.4f | val_acc=%.2f%%  (lr=%.2e)",
             epoch, n_epochs, train_loss, val_loss, val_acc * 100,
+            optimizer.param_groups[0]["lr"],
         )
 
         if val_acc > best_val_acc:
@@ -342,3 +421,8 @@ def train(
     logger.info("label_map sauvegardé dans %s", label_map_path)
 
     logger.info("Entraînement terminé. Meilleure val_acc : %.2f%%", best_val_acc * 100)
+
+    # Recharge le meilleur modèle pour le diagnostic final
+    best_ckpt = torch.load(save_path, map_location=device, weights_only=False)
+    model.load_state_dict(best_ckpt["model_state_dict"])
+    _log_per_class_accuracy(model, val_loader, label_map, device)

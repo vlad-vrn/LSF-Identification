@@ -20,9 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from data.loader import get_label_map, load_dataset
 from model.train import N_EPOCHS, LR, train
 
-# Restreint l'entraînement aux 5 signes les mieux représentés.
-# Mettre à None pour entraîner sur tous les signes disponibles.
-ALLOWED_SIGNS: list[str] | None = ["soif", "boire", "aujourd_hui", "aimer", "aller"]
+# Filtre optionnel — None = tous les signes du dataset.
+ALLOWED_SIGNS: list[str] | None = None
 
 
 def _filter_samples(

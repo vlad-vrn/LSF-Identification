@@ -1,96 +1,84 @@
 """
 Définition du modèle 1D-CNN pour la classification de signes LSF.
 
-Input : (B, 64, 320) — batch de séquences de 64 frames × 320 features.
-Output : (B, n_classes) — logits bruts (pas de softmax).
+Input  : (B, 64, 320)  — batch de séquences normalisées
+Output : (B, n_classes) — logits bruts (pas de softmax)
 """
 
 import torch
 import torch.nn as nn
 
-# Dimensions fixes du pipeline
 SEQUENCE_LENGTH = 64
 FEATURE_DIM = 320
+
+# Constantes d'architecture — modifier ici uniquement
+_CHANNELS = (64, 128, 128)   # filtres par bloc (bloc1, bloc2, bloc3)
+_KERNELS   = (7,   5,   3)   # kernel_size par bloc (large → fin)
+_FC_HIDDEN = 64              # unités couche FC intermédiaire
+_DROPOUT   = 0.4             # dropout avant la couche finale
 
 
 class LSFClassifier(nn.Module):
     """
-    1D-CNN pour classer des séquences de keypoints LSF.
+    3 blocs Conv1d + BatchNorm1d + ReLU + MaxPool1d, suivi de GlobalMaxPool et d'un MLP.
 
-    Architecture choisie :
-      Deux blocs Conv1d → ReLU → MaxPool1d, suivis d'un MLP.
-
-    Choix de conception :
-    - kernel_size=5 sur le premier bloc : fenêtre temporelle de 5 frames
-      (~160 ms à 30fps) pour capturer les débuts de mouvement.
-    - kernel_size=3 sur le second : affine la représentation sur une fenêtre
-      plus courte une fois les features compressées.
-    - MaxPool1d(2) × 2 : divise la longueur temporelle par 4 (64 → 16),
-      rendant le modèle robuste aux décalages temporels légers.
-    - Pas de BatchNorm : dataset trop petit pour que la statistique de batch
-      soit stable ; le z-score du preprocessing remplace cette normalisation.
-    - Dropout(0.3) avant la couche finale : régularisation principale.
-    - Pas de Softmax en sortie : CrossEntropyLoss l'inclut dans PyTorch.
+    Changements vs V1 :
+    - BatchNorm1d après chaque conv : stabilise les gradients, permet un LR plus élevé
+      et réduit le surapprentissage même sur petit dataset (les stats de batch sur
+      32×64=2048 activations sont suffisantes).
+    - 3e bloc conv (k=3) : features plus fines après deux compressions temporelles.
+    - GlobalMaxPool au lieu de Flatten : robuste aux décalages temporels,
+      ramène la tête de 1024→128 (362k params) à 128→64 (~150k params).
+    - LayerNorm dans la tête FC : normalise les activations post-GlobalMax.
+    - Dropout porté à 0.4 pour compenser l'expressivité accrue du 3e bloc.
     """
 
     def __init__(self, n_classes: int) -> None:
-        """
-        Args:
-            n_classes: Nombre de signes à classifier.
-        """
         super().__init__()
+        self.n_classes = n_classes
 
-        # Bloc 1 : extrait les patterns locaux sur 5 frames
-        # (B, 320, 64) → (B, 128, 64) → (B, 128, 32)
-        self.conv1 = nn.Sequential(
-            nn.Conv1d(in_channels=FEATURE_DIM, out_channels=128, kernel_size=5, padding=2),
+        # (B, 320, 64) → (B, 64,  32)
+        self.conv1 = self._conv_block(FEATURE_DIM,   _CHANNELS[0], _KERNELS[0])
+        # (B, 64,  32) → (B, 128, 16)
+        self.conv2 = self._conv_block(_CHANNELS[0],   _CHANNELS[1], _KERNELS[1])
+        # (B, 128, 16) → (B, 128,  8)
+        self.conv3 = self._conv_block(_CHANNELS[1],   _CHANNELS[2], _KERNELS[2])
+
+        # GlobalMaxPool → (B, 128) puis tête de classification
+        self.head = nn.Sequential(
+            nn.Linear(_CHANNELS[2], _FC_HIDDEN),
+            nn.LayerNorm(_FC_HIDDEN),
             nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(_DROPOUT),
+            nn.Linear(_FC_HIDDEN, n_classes),
         )
 
-        # Bloc 2 : combine les patterns locaux sur 3 frames
-        # (B, 128, 32) → (B, 64, 32) → (B, 64, 16)
-        self.conv2 = nn.Sequential(
-            nn.Conv1d(in_channels=128, out_channels=64, kernel_size=3, padding=1),
+    @staticmethod
+    def _conv_block(in_ch: int, out_ch: int, kernel: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size=kernel, padding=kernel // 2),
+            nn.BatchNorm1d(out_ch),
             nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-        )
-
-        # Tête de classification
-        # (B, 64*16) → (B, 128) → (B, n_classes)
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 16, 128),
-            nn.ReLU(),
-            nn.Dropout(p=0.3),
-            nn.Linear(128, n_classes),
+            nn.MaxPool1d(2),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: shape (B, 64, 320) — batch de séquences.
+            x: shape (B, 64, 320)
 
         Returns:
             Logits shape (B, n_classes).
         """
-        # Conv1d attend (B, C, L) : on transpose features ↔ frames
-        x = x.transpose(1, 2)   # (B, 320, 64)
-        x = self.conv1(x)        # (B, 128, 32)
-        x = self.conv2(x)        # (B, 64, 16)
-        return self.classifier(x)  # (B, n_classes)
+        x = x.transpose(1, 2)    # (B, 320, 64) — Conv1d attend (B, C, L)
+        x = self.conv1(x)         # (B, 64,  32)
+        x = self.conv2(x)         # (B, 128, 16)
+        x = self.conv3(x)         # (B, 128,  8)
+        x = x.max(dim=2).values   # GlobalMaxPool → (B, 128)
+        return self.head(x)       # (B, n_classes)
 
 
 def make_classifier(n_classes: int) -> LSFClassifier:
-    """
-    Crée une instance de LSFClassifier avec les poids initialisés par défaut.
-
-    Args:
-        n_classes: Nombre de classes (signes) à classifier.
-
-    Returns:
-        Modèle non entraîné prêt pour l'entraînement.
-    """
     return LSFClassifier(n_classes=n_classes)
 
 
@@ -100,6 +88,4 @@ if __name__ == "__main__":
     out = model(x)
     assert out.shape == (4, 12), f"Expected (4, 12), got {out.shape}"
     print("Shape OK:", out.shape)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Parametres total : {total_params:,}")
+    print(f"Paramètres : {sum(p.numel() for p in model.parameters()):,}")

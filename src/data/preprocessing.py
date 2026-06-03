@@ -57,7 +57,7 @@ def _hand_total_movement(hand_frames: np.ndarray) -> float:
     return float(np.linalg.norm(diffs))
 
 
-def _resample(frames: np.ndarray, target_length: int) -> np.ndarray:
+def resample_sequence(frames: np.ndarray, target_length: int) -> np.ndarray:
     """
     Rééchantillonne une séquence vers target_length frames par interpolation linéaire.
 
@@ -193,7 +193,7 @@ def trim_rest_frames(
         return frames
 
     trimmed = frames[start_frame:end_frame]  # (n_frames, 318)
-    return _resample(trimmed, SEQUENCE_LENGTH)
+    return resample_sequence(trimmed, SEQUENCE_LENGTH)
 
 
 def build_feature_vector(frames: np.ndarray) -> np.ndarray:
@@ -241,30 +241,104 @@ def build_feature_vector(frames: np.ndarray) -> np.ndarray:
     return feature.astype(np.float32)
 
 
+def augment_noise(frames: np.ndarray, std: float = 0.003) -> np.ndarray:
+    """
+    Ajoute du bruit gaussien aux keypoints pour simuler le jitter MediaPipe.
+
+    Les frames où une main est entièrement absente (convention : tous les floats
+    exactement à 0) ne sont pas bruitées pour ne pas créer de fausse détection
+    de présence lors du calcul des flags dans build_feature_vector.
+
+    Args:
+        frames: shape (N, 318) — sample brut.
+        std:    écart-type du bruit (défaut 0.003 ≈ 0.3% de la plage [0, 1]).
+
+    Returns:
+        shape (N, 318), float32.
+    """
+    result = frames.copy()
+    noise = np.random.normal(0, std, frames.shape).astype(np.float32)
+    result += noise
+
+    # Remet à zéro les frames des mains absentes pour conserver la convention
+    left_absent = np.all(frames[:, _LEFT_START:_LEFT_END] == 0, axis=1)   # (N,) bool
+    right_absent = np.all(frames[:, _RIGHT_START:_RIGHT_END] == 0, axis=1)
+    result[left_absent,  _LEFT_START:_LEFT_END]   = 0.0
+    result[right_absent, _RIGHT_START:_RIGHT_END] = 0.0
+
+    return result
+
+
+def augment_mirror(frames: np.ndarray) -> np.ndarray:
+    """
+    Augmentation miroir : échange les colonnes main gauche et main droite.
+
+    Simule l'effet miroir de la webcam (comportement navigateur par défaut)
+    et la variabilité gaucher/droitier. La détection de main dominante dans
+    build_feature_vector absorbera naturellement cet échange.
+
+    Args:
+        frames: shape (N, 318) — sample brut.
+
+    Returns:
+        shape (N, 318), float32, mains échangées.
+    """
+    result = frames.copy()
+    left  = frames[:, _LEFT_START:_LEFT_END].copy()
+    right = frames[:, _RIGHT_START:_RIGHT_END].copy()
+    result[:, _LEFT_START:_LEFT_END]   = right
+    result[:, _RIGHT_START:_RIGHT_END] = left
+    return result
+
+
 def augment_sample(
     frames: np.ndarray,
     n_augments: int = 4,
 ) -> list[np.ndarray]:
     """
-    Génère des variantes augmentées d'un sample par trim aléatoire du début.
+    Génère des variantes augmentées par combinaison de quatre transformations :
 
-    Pour chaque variante, coupe entre 1 et MAX_TRIM_START frames au début,
-    puis rééchantillonne vers SEQUENCE_LENGTH frames. L'original (sans coupe)
-    est inclus en tête de liste.
+    1. Trim aléatoire du début (0–MAX_TRIM_START frames) — simule un démarrage
+       du signe à différents moments dans la fenêtre.
+    2. Jitter de vitesse (50 % de chance) : prend 70–100 % des frames puis
+       rééchantillonne à 64 — simule un signe exécuté plus rapidement.
+    3. Bruit gaussien faible (toujours) — simule le jitter de détection MediaPipe.
+    4. Augmentation miroir (30 % de chance) — échange main gauche et droite
+       pour la robustesse à l'effet miroir webcam et aux gauchers.
+
+    L'original est toujours inclus en premier, sans aucune transformation.
 
     Args:
         frames:     shape (64, 318) — sample brut (avant build_feature_vector).
-        n_augments: nombre de variantes augmentées à générer (hors original).
+        n_augments: nombre de variantes à générer (hors original).
 
     Returns:
-        Liste de n_augments + 1 arrays de shape (64, 318), incluant l'original.
+        Liste de n_augments + 1 arrays de shape (64, 318).
     """
-    result: list[np.ndarray] = [frames]  # original en premier
+    result: list[np.ndarray] = [frames]
 
     for _ in range(n_augments):
-        trim_start = np.random.randint(1, MAX_TRIM_START + 1)
-        trimmed = frames[trim_start:]                        # (64-trim_start, 318)
-        resampled = _resample(trimmed, SEQUENCE_LENGTH)      # (64, 318)
-        result.append(resampled)
+        aug = frames.copy()
+
+        # 1. Trim aléatoire du début
+        trim_start = np.random.randint(0, MAX_TRIM_START + 1)
+        if trim_start > 0:
+            aug = aug[trim_start:]
+            aug = resample_sequence(aug, SEQUENCE_LENGTH)
+
+        # 2. Jitter de vitesse : prend une fraction des frames (signe plus rapide)
+        if np.random.random() < 0.5:
+            factor = np.random.uniform(0.7, 1.0)
+            n_keep = max(MIN_FRAMES_AFTER_TRIM, round(len(aug) * factor))
+            aug = resample_sequence(aug[:n_keep], SEQUENCE_LENGTH)
+
+        # 3. Bruit gaussien (simule le jitter MediaPipe)
+        aug = augment_noise(aug, std=0.003)
+
+        # 4. Miroir (simule webcam non miroir et gauchers)
+        if np.random.random() < 0.3:
+            aug = augment_mirror(aug)
+
+        result.append(aug)
 
     return result

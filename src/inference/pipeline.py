@@ -2,11 +2,17 @@
 Pipeline d'inférence temps réel pour la reconnaissance LSF.
 
 Le flux de frames MediaPipe est accumulé dans un buffer circulaire.
-Toutes les INFERENCE_STRIDE frames, si le buffer est plein, on lance
-une inférence et on tente de confirmer le signe par déduplication.
+Toutes les INFERENCE_STRIDE frames, si buffer plein + mouvement suffisant
++ pas de cooldown actif, on lance une inférence CNN.
 
-Design : état représenté par un dict simple (pas de classe) pour rester
-cohérent avec la convention "fonctions simples" du projet V1.
+Filtres anti-faux-positifs (en couches successives) :
+  1. Gate de mouvement     : MOVEMENT_THRESHOLD — pas d'inférence au repos
+  2. Seuil confiance       : CONFIDENCE_THRESHOLD — softmax dominant suffisant
+  3. Seuil entropie        : UNCERTAINTY_GATE — bloque si modèle trop incertain
+  4. Marge top1-top2       : CONFIDENCE_MARGIN — bloque si deux classes proches
+  5. Dédup N consécutives  : DEDUP_COUNT — confirmation temporelle
+  6. Reset dédup au repos  : si mouvement < seuil entre deux strides → reset
+  7. Cooldown post-confirm  : buffer vidé + inférence suspendue COOLDOWN_FRAMES frames
 """
 
 import logging
@@ -21,281 +27,218 @@ from data.preprocessing import build_feature_vector
 
 logger = logging.getLogger(__name__)
 
-# Nombre de frames dans la fenêtre d'inférence (cohérent avec le dataset)
 SEQUENCE_LENGTH: int = 64
 
-# À 30fps, stride=15 = nouvelle inférence toutes les 0.5s.
-# Compromis entre réactivité (stride bas) et charge CPU (stride haut).
+# À 30fps, stride=15 → inférence toutes les ~0.5s.
 INFERENCE_STRIDE: int = 15
 
-# Seuil de mouvement minimum pour lancer l'inférence.
-# Calculé comme la somme des normes L2 des déplacements frame-à-frame
-# sur les colonnes main gauche + main droite (indices 132:258 du vecteur brut).
-# Si personne ne bouge, ce score est proche de 0 (jitter MediaPipe seulement).
-# Valeur empirique : à ajuster selon la sensibilité souhaitée.
-MOVEMENT_THRESHOLD: float = 1.5
-
-# Nombre de prédictions consécutives identiques avant de confirmer un signe.
-# 2 × 0.5s = 1s — compromis entre filtrage des faux positifs et latence.
-# Avec 3 : trop long à tenir (1.5s), peu naturel pour des signes dynamiques.
-# Repasser à 3 si trop de faux positifs en pratique.
+# 2 prédictions consécutives cohérentes → confirmation (~1s de cohérence).
 DEDUP_COUNT: int = 2
 
-# Seuil de confiance softmax pour valider une prédiction.
-# 0.6 = valeur de départ raisonnable sur 12 classes (chance = 0.083).
-# À ajuster après avoir mesuré les distributions de confiance en pratique.
+# Seuil softmax minimum pour qu'une prédiction entre dans la dédup.
 CONFIDENCE_THRESHOLD: float = 0.6
 
+# Mouvement minimum des mains (somme normes L2 frame-à-frame) pour déclencher
+# l'inférence. Évite les prédictions en continu quand les mains sont au repos.
+MOVEMENT_THRESHOLD: float = 1.5
 
-# ---------------------------------------------------------------------------
-# Création de l'état (InferenceBuffer)
-# ---------------------------------------------------------------------------
+# Marge minimum entre top1 et top2 softmax.
+# Évite les confirmations ambiguës (modèle hésitant entre deux signes proches).
+# Ex. top1=0.45, top2=0.42 → marge=0.03 < 0.15 → refusé.
+CONFIDENCE_MARGIN: float = 0.15
+
+# Entropie normalisée maximum pour compter dans la dédup.
+# 0.75 ≈ distribution très étalée sur les classes → modèle incertain.
+# Un signe non reconnu produit une entropie élevée → bloqué ici.
+UNCERTAINTY_GATE: float = 0.75
+
+# Frames de cooldown après confirmation : le buffer est vidé et l'inférence
+# suspendue COOLDOWN_FRAMES frames (~0.7s à 30fps). En pratique, le buffer
+# a aussi besoin de ~2s pour se remplir, ce qui donne ~2.7s minimum entre signes.
+COOLDOWN_FRAMES: int = 20
+
 
 def make_inference_state() -> dict:
     """
     Crée un état d'inférence vierge.
 
-    Structure :
-        buffer           : deque(maxlen=64) — frames brutes (318 floats chacune)
-        stride_counter   : int — compte les frames depuis la dernière inférence
-        last_predictions : deque(maxlen=3) — tuples (label, confidence)
-
-    Returns:
-        Dict d'état prêt à être passé à push_frame.
+    Champs :
+        buffer           : deque(maxlen=64) — frames brutes (318,)
+        stride_counter   : int — frames depuis la dernière tentative d'inférence
+        last_predictions : deque(maxlen=DEDUP_COUNT) — (label, confidence)
+        cooldown_counter : int — frames restantes avant de reprendre l'inférence
     """
     return {
         "buffer": deque(maxlen=SEQUENCE_LENGTH),
         "stride_counter": 0,
         "last_predictions": deque(maxlen=DEDUP_COUNT),
+        "cooldown_counter": 0,
     }
 
 
-# ---------------------------------------------------------------------------
-# push_frame
-# ---------------------------------------------------------------------------
-
 def push_frame(state: dict, frame_features: np.ndarray) -> dict:
-    """
-    Ajoute une frame préprocessée au buffer et incrémente le stride_counter.
-
-    Args:
-        state:          Dict d'état issu de make_inference_state().
-        frame_features: Vecteur de 318 floats bruts pour cette frame
-                        (pose + left_hand + right_hand + face — sans flags).
-                        La détection dominant/passif et le z-score sont appliqués
-                        sur la fenêtre complète au moment de l'inférence.
-
-    Returns:
-        Le même dict d'état mis à jour (modification en place + retour pour
-        permettre un usage fonctionnel si souhaité).
-    """
+    """Ajoute une frame brute (318,) au buffer et décrémente le cooldown."""
     state["buffer"].append(frame_features.astype(np.float32))
     state["stride_counter"] += 1
+    if state["cooldown_counter"] > 0:
+        state["cooldown_counter"] -= 1
     return state
 
 
-# ---------------------------------------------------------------------------
-# should_run_inference
-# ---------------------------------------------------------------------------
-
 def _window_movement(state: dict) -> float:
-    """
-    Calcule le mouvement total des mains sur la fenêtre courante.
-
-    On mesure la somme des normes L2 des déplacements frame-à-frame,
-    uniquement sur les colonnes main gauche + droite (indices 132:258).
-    La pose et le visage sont exclus : ils bougent même quand on est immobile
-    (respiration, micro-mouvements de la tête).
-
-    Args:
-        state: Dict d'état avec buffer non vide.
-
-    Returns:
-        Score de mouvement (float ≥ 0). Proche de 0 si immobile.
-    """
+    """Mouvement total des mains (gauche+droite) sur la fenêtre courante."""
+    if len(state["buffer"]) < 2:
+        return 0.0
     frames = np.stack(list(state["buffer"]))   # (N, 318)
-    hands = frames[:, 132:258]                  # (N, 126) — gauche + droite
-    diffs = np.diff(hands, axis=0)              # (N-1, 126)
+    hands = frames[:, 132:258]                  # (N, 126) — left+right uniquement
+    diffs = np.diff(hands, axis=0)
     return float(np.linalg.norm(diffs, axis=1).sum())
 
 
 def should_run_inference(state: dict) -> bool:
     """
-    Détermine si une inférence doit être lancée sur la frame courante.
+    True si buffer plein, stride atteint, cooldown terminé ET mouvement suffisant.
 
-    Conditions :
-      1. Buffer plein (64 frames)
-      2. stride_counter >= INFERENCE_STRIDE
-      3. Mouvement des mains dans la fenêtre > MOVEMENT_THRESHOLD
-
-    La condition 3 empêche le modèle de tourner en continu quand la personne
-    est immobile — sans elle, le modèle prédit toujours la classe majoritaire
-    même sans signe.
-
-    Si les conditions 1+2 sont réunies, stride_counter est remis à 0
-    (que le mouvement soit suffisant ou non, pour éviter l'accumulation).
-
-    Args:
-        state: Dict d'état courant.
-
-    Returns:
-        True si une inférence doit être lancée, False sinon.
+    Si le mouvement est insuffisant, réinitialise la dédup : cela évite les
+    confirmations différées où une prédiction ancienne se combine avec une
+    nouvelle pour former une fausse concordance après une pause.
     """
-    buffer_full = len(state["buffer"]) == SEQUENCE_LENGTH
-    stride_reached = state["stride_counter"] >= INFERENCE_STRIDE
-
-    if not (buffer_full and stride_reached):
+    if len(state["buffer"]) < SEQUENCE_LENGTH:
+        return False
+    if state["stride_counter"] < INFERENCE_STRIDE:
         return False
 
     state["stride_counter"] = 0
 
-    movement = _window_movement(state)
-    if movement < MOVEMENT_THRESHOLD:
-        logger.debug("Mouvement insuffisant (%.2f < %.2f) — inférence ignorée", movement, MOVEMENT_THRESHOLD)
+    if state["cooldown_counter"] > 0:
+        return False
+
+    if _window_movement(state) < MOVEMENT_THRESHOLD:
+        state["last_predictions"].clear()
+        logger.debug("Mouvement insuffisant — dédup réinitialisée")
         return False
 
     return True
 
-
-# ---------------------------------------------------------------------------
-# run_inference
-# ---------------------------------------------------------------------------
 
 def run_inference(
     model: nn.Module,
     state: dict,
     label_map: dict[str, int],
     device: torch.device,
-) -> tuple[str, float, float] | None:
+) -> tuple[str, float, float, float, list[tuple[str, float]]] | None:
     """
-    Lance l'inférence sur les 64 frames du buffer.
-
-    Applique le z-score par feature sur la fenêtre courante (même normalisation
-    que build_feature_vector au training) avant de passer au modèle.
-
-    Args:
-        model:     LSFClassifier chargé en mode eval.
-        state:     Dict d'état avec buffer plein.
-        label_map: Dict {slug: idx} pour convertir l'indice en label.
-        device:    Dispositif de calcul (cpu).
+    Lance l'inférence CNN sur les 64 frames du buffer.
 
     Returns:
-        (label, confidence, uncertainty) si le buffer est plein, None sinon.
+        (label, confidence, uncertainty, margin, top3) ou None si buffer incomplet.
         - confidence  : probabilité softmax du meilleur label (0–1)
-        - uncertainty : entropie normalisée (0 = très sûr, 1 = aléatoire total)
-          Un signe inconnu produit une distribution plate → uncertainty proche de 1.
+        - uncertainty : entropie normalisée (0=certain, 1=aléatoire total)
+        - margin      : écart top1 - top2 (0–1) — proche de 0 = ambigu
+        - top3        : liste des 3 meilleures prédictions [(label, prob), ...]
     """
     if len(state["buffer"]) < SEQUENCE_LENGTH:
         return None
 
-    # Empile les 64 frames brutes en (64, 318)
-    raw = np.stack(list(state["buffer"]))   # (64, 318)
+    raw = np.stack(list(state["buffer"]))    # (64, 318)
+    frames = build_feature_vector(raw)        # (64, 320)
 
-    # Applique le même preprocessing que l'entraînement :
-    # trim, dominant/passif, flags de présence, z-score → (64, 320)
-    frames = build_feature_vector(raw)
-
-    x = torch.tensor(frames, dtype=torch.float32).unsqueeze(0).to(device)  # (1, 64, 320)
+    x = torch.tensor(frames, dtype=torch.float32).unsqueeze(0).to(device)
 
     model.eval()
     with torch.no_grad():
-        logits = model(x)                                   # (1, n_classes)
-        probs = torch.softmax(logits, dim=1)[0]             # (n_classes,)
+        logits = model(x)
+        probs = torch.softmax(logits, dim=1)[0]
 
-    best_idx = int(probs.argmax())
-    confidence = float(probs[best_idx])
+    sorted_probs, sorted_indices = probs.sort(descending=True)
+    best_idx = int(sorted_indices[0])
+    confidence = float(sorted_probs[0])
+    margin = float(sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else 1.0
 
-    # Entropie normalisée : mesure à quel point la distribution est plate.
-    # entropy = -Σ p·log(p), normalisée par log(n_classes) → [0, 1]
-    # Vaut 0 quand le modèle est certain, 1 quand toutes les classes sont équiprobables.
     p = probs.cpu().numpy().astype(np.float64)
-    n_classes = len(p)
     entropy = -float(np.sum(p * np.log(p + 1e-9)))
-    uncertainty = entropy / math.log(n_classes)
+    uncertainty = entropy / math.log(len(p))
 
-    # Mapping inverse idx → slug
     idx_to_label = {v: k for k, v in label_map.items()}
     label = idx_to_label.get(best_idx, f"classe_{best_idx}")
 
-    return label, confidence, uncertainty
+    top3 = [
+        (idx_to_label.get(int(sorted_indices[i]), f"cls_{i}"), float(sorted_probs[i]))
+        for i in range(min(3, len(sorted_indices)))
+    ]
 
+    return label, confidence, uncertainty, margin, top3
 
-# ---------------------------------------------------------------------------
-# deduplicate
-# ---------------------------------------------------------------------------
 
 def deduplicate(
     state: dict,
     label: str,
     confidence: float,
+    uncertainty: float,
+    margin: float,
     threshold: float = CONFIDENCE_THRESHOLD,
 ) -> str | None:
     """
-    Confirme un signe si les DEDUP_COUNT dernières prédictions sont cohérentes.
+    Confirme un signe après DEDUP_COUNT prédictions consécutives de qualité.
 
-    Un signe est confirmé quand :
-    - Les DEDUP_COUNT dernières prédictions (incluant la courante) sont le même label
-    - Toutes ont une confiance supérieure au seuil
+    Une prédiction est acceptée dans la dédup si toutes ces conditions sont vraies :
+    - confidence > threshold     (softmax dominant suffisant)
+    - uncertainty < UNCERTAINTY_GATE (entropie basse — modèle sûr du label)
+    - margin > CONFIDENCE_MARGIN (top1 nettement au-dessus de top2)
 
-    Cette double condition (temporelle + confiance) réduit fortement les faux
-    positifs sans introduire de délai perceptible (DEDUP_COUNT × 0.5s = 1.5s max).
+    Si une prédiction échoue, le compteur est réinitialisé : mieux vaut exiger
+    N prédictions consécutives propres que tolérer du bruit entre elles.
 
-    Args:
-        state:      Dict d'état contenant last_predictions.
-        label:      Label de la prédiction courante.
-        confidence: Confiance softmax de la prédiction courante.
-        threshold:  Seuil de confiance minimum (défaut CONFIDENCE_THRESHOLD).
-
-    Returns:
-        Le label si confirmé, None sinon.
+    Après confirmation :
+    - buffer vidé (les frames du signe ne sont plus réutilisées)
+    - cooldown activé (inférence suspendue COOLDOWN_FRAMES frames)
     """
+    quality_ok = (
+        confidence > threshold
+        and uncertainty < UNCERTAINTY_GATE
+        and margin > CONFIDENCE_MARGIN
+    )
+
+    if not quality_ok:
+        state["last_predictions"].clear()
+        return None
+
     state["last_predictions"].append((label, confidence))
 
     if len(state["last_predictions"]) < DEDUP_COUNT:
         return None
 
     labels = [p[0] for p in state["last_predictions"]]
-    confidences = [p[1] for p in state["last_predictions"]]
-
-    all_same_label = len(set(labels)) == 1
-    all_above_threshold = all(c > threshold for c in confidences)
-
-    if all_same_label and all_above_threshold:
-        # Vide le buffer après confirmation pour éviter de confirmer
-        # le même signe en boucle tant que la pose est maintenue.
+    if len(set(labels)) != 1:
         state["last_predictions"].clear()
-        return label
+        return None
 
-    return None
+    # Confirmation — réinitialise tout pour le prochain signe
+    state["last_predictions"].clear()
+    state["buffer"].clear()
+    state["cooldown_counter"] = COOLDOWN_FRAMES
+    return label
 
 
-# ---------------------------------------------------------------------------
-# get_dedup_progress
-# ---------------------------------------------------------------------------
-
-def get_dedup_progress(state: dict) -> tuple[int, str | None]:
+def get_dedup_progress(state: dict) -> tuple[int, str | None, int]:
     """
-    Retourne l'avancement de la déduplication pour l'affichage temps réel.
+    Retourne (n_consécutifs, dernier_label, cooldown_restant).
 
-    Compte les prédictions consécutives identiques depuis la plus récente,
-    ce qui permet d'afficher une progression type "●●○" vers la confirmation.
-
-    Args:
-        state: Dict d'état courant.
-
-    Returns:
-        (count, label) — nombre de prédictions consécutives du même label
-        depuis la fin, et ce label. (0, None) si le buffer est vide.
+    n_consécutifs : nombre de prédictions identiques depuis la plus récente.
+    cooldown_restant : frames avant la prochaine inférence (0 = prêt).
+    Utilisé pour l'affichage des points de progression et du flash de confirmation.
     """
     preds = list(state["last_predictions"])
+    cooldown = state["cooldown_counter"]
+
     if not preds:
-        return 0, None
+        return 0, None, cooldown
 
     last_label = preds[-1][0]
     count = 0
-    for label, _ in reversed(preds):
-        if label == last_label:
+    for lbl, _ in reversed(preds):
+        if lbl == last_label:
             count += 1
         else:
             break
-    return count, last_label
+    return count, last_label, cooldown
