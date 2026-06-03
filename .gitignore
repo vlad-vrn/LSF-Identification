@@ -1,0 +1,42 @@
+# Environnement virtuel
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Dataset — ne pas versionner les données brutes
+dataset/
+
+# Modèles entraînés — binaires lourds
+models/*.pt
+models/*.pth
+# label_map.json est versionné (petit, utile pour l'inférence)
+!models/label_map.json
+!models/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
