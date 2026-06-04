@@ -1,18 +1,24 @@
 """
-Pipeline d'inférence temps réel pour la reconnaissance LSF.
+Pipeline d'inférence temps réel CADENCÉE pour la reconnaissance LSF.
 
-Le flux de frames MediaPipe est accumulé dans un buffer circulaire.
-Toutes les INFERENCE_STRIDE frames, si buffer plein + mouvement suffisant
-+ pas de cooldown actif, on lance une inférence CNN.
+Remplace l'ancienne détection continue « signe / pas de signe » (gate de
+mouvement + déduplication + cooldown) par une capture rythmée type métronome,
+qui synchronise l'utilisateur sur la fenêtre exacte attendue par le modèle
+(SEQUENCE_LENGTH frames, comme à l'entraînement).
 
-Filtres anti-faux-positifs (en couches successives) :
-  1. Gate de mouvement     : MOVEMENT_THRESHOLD — pas d'inférence au repos
-  2. Seuil confiance       : CONFIDENCE_THRESHOLD — softmax dominant suffisant
-  3. Seuil entropie        : UNCERTAINTY_GATE — bloque si modèle trop incertain
-  4. Marge top1-top2       : CONFIDENCE_MARGIN — bloque si deux classes proches
-  5. Dédup N consécutives  : DEDUP_COUNT — confirmation temporelle
-  6. Reset dédup au repos  : si mouvement < seuil entre deux strides → reset
-  7. Cooldown post-confirm  : buffer vidé + inférence suspendue COOLDOWN_FRAMES frames
+Boucle à 4 phases, répétée indéfiniment :
+
+    PREPARE  → décompte 3-2-1, l'utilisateur se met en position
+    CAPTURE  → on enregistre exactement CAPTURE_FRAMES frames pendant que
+               l'utilisateur réalise UN signe
+    RESULT   → une inférence est lancée, le résultat est affiché
+    REST     → courte pause avant le battement suivant
+
+Une seule prédiction par battement. Si la confiance est sous le seuil, le
+résultat est « non reconnu » et rien n'est ajouté à la phrase.
+
+Toutes les durées sont des constantes nommées, surchargeables à la création de
+l'état (make_cadence_state) — elles-mêmes exposées en arguments CLI par run.py.
 """
 
 import logging
@@ -29,216 +35,185 @@ logger = logging.getLogger(__name__)
 
 SEQUENCE_LENGTH: int = 64
 
-# À 30fps, stride=15 → inférence toutes les ~0.5s.
-INFERENCE_STRIDE: int = 15
+# --- Durées des phases, en frames (≈ valeurs à 30 fps) ---
+PREPARE_FRAMES: int = 60          # ~2.0 s — décompte 3-2-1
+CAPTURE_FRAMES: int = SEQUENCE_LENGTH  # ~2.1 s — fenêtre du signe (= entraînement)
+RESULT_FRAMES: int = 45           # ~1.5 s — affichage du résultat
+REST_FRAMES: int = 18             # ~0.6 s — pause entre deux battements
 
-# 2 prédictions consécutives cohérentes → confirmation (~1s de cohérence).
-DEDUP_COUNT: int = 2
+# Seuil de confiance softmax sous lequel le signe est déclaré « non reconnu ».
+# Volontairement bas : on accepte le meilleur label dès qu'il dépasse 10 %,
+# pour afficher quasi systématiquement une prédiction plutôt que « non reconnu ».
+CONFIDENCE_THRESHOLD: float = 0.10
 
-# Seuil softmax minimum pour qu'une prédiction entre dans la dédup.
-CONFIDENCE_THRESHOLD: float = 0.6
+# --- Phases ---
+PHASE_PREPARE: str = "prepare"
+PHASE_CAPTURE: str = "capture"
+PHASE_RESULT: str = "result"
+PHASE_REST: str = "rest"
 
-# Mouvement minimum des mains (somme normes L2 frame-à-frame) pour déclencher
-# l'inférence. Évite les prédictions en continu quand les mains sont au repos.
-MOVEMENT_THRESHOLD: float = 1.5
-
-# Marge minimum entre top1 et top2 softmax.
-# Évite les confirmations ambiguës (modèle hésitant entre deux signes proches).
-# Ex. top1=0.45, top2=0.42 → marge=0.03 < 0.15 → refusé.
-CONFIDENCE_MARGIN: float = 0.15
-
-# Entropie normalisée maximum pour compter dans la dédup.
-# 0.75 ≈ distribution très étalée sur les classes → modèle incertain.
-# Un signe non reconnu produit une entropie élevée → bloqué ici.
-UNCERTAINTY_GATE: float = 0.75
-
-# Frames de cooldown après confirmation : le buffer est vidé et l'inférence
-# suspendue COOLDOWN_FRAMES frames (~0.7s à 30fps). En pratique, le buffer
-# a aussi besoin de ~2s pour se remplir, ce qui donne ~2.7s minimum entre signes.
-COOLDOWN_FRAMES: int = 20
+_NEXT_PHASE: dict[str, str] = {
+    PHASE_PREPARE: PHASE_CAPTURE,
+    PHASE_CAPTURE: PHASE_RESULT,
+    PHASE_RESULT: PHASE_REST,
+    PHASE_REST: PHASE_PREPARE,
+}
 
 
-def make_inference_state() -> dict:
+def make_cadence_state(
+    prepare_frames: int = PREPARE_FRAMES,
+    capture_frames: int = CAPTURE_FRAMES,
+    result_frames: int = RESULT_FRAMES,
+    rest_frames: int = REST_FRAMES,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+) -> dict:
     """
-    Crée un état d'inférence vierge.
+    Crée un état de cadence vierge (démarre en phase PREPARE).
 
     Champs :
-        buffer           : deque(maxlen=64) — frames brutes (318,)
-        stride_counter   : int — frames depuis la dernière tentative d'inférence
-        last_predictions : deque(maxlen=DEDUP_COUNT) — (label, confidence)
-        cooldown_counter : int — frames restantes avant de reprendre l'inférence
+        phase            : phase courante (PHASE_*)
+        frame_in_phase   : nombre de frames écoulées dans la phase courante
+        capture          : liste des frames brutes (318,) enregistrées en CAPTURE
+        result           : dernier résultat d'inférence (dict) ou None
+        durations        : {phase: durée en frames}
+        confidence_threshold : seuil d'acceptation
     """
     return {
-        "buffer": deque(maxlen=SEQUENCE_LENGTH),
-        "stride_counter": 0,
-        "last_predictions": deque(maxlen=DEDUP_COUNT),
-        "cooldown_counter": 0,
+        "phase": PHASE_PREPARE,
+        "frame_in_phase": 0,
+        "capture": [],
+        "result": None,
+        "durations": {
+            PHASE_PREPARE: prepare_frames,
+            PHASE_CAPTURE: capture_frames,
+            PHASE_RESULT: result_frames,
+            PHASE_REST: rest_frames,
+        },
+        "confidence_threshold": confidence_threshold,
     }
 
 
-def push_frame(state: dict, frame_features: np.ndarray) -> dict:
-    """Ajoute une frame brute (318,) au buffer et décrémente le cooldown."""
-    state["buffer"].append(frame_features.astype(np.float32))
-    state["stride_counter"] += 1
-    if state["cooldown_counter"] > 0:
-        state["cooldown_counter"] -= 1
-    return state
+def _enter_phase(state: dict, phase: str) -> None:
+    """Bascule l'état vers une nouvelle phase et réinitialise les compteurs utiles."""
+    state["phase"] = phase
+    state["frame_in_phase"] = 0
+    if phase == PHASE_CAPTURE:
+        state["capture"] = []
+    if phase == PHASE_PREPARE:
+        state["result"] = None   # on efface le résultat précédent avant le prochain signe
 
 
-def _window_movement(state: dict) -> float:
-    """Mouvement total des mains (gauche+droite) sur la fenêtre courante."""
-    if len(state["buffer"]) < 2:
-        return 0.0
-    frames = np.stack(list(state["buffer"]))   # (N, 318)
-    hands = frames[:, 132:258]                  # (N, 126) — left+right uniquement
-    diffs = np.diff(hands, axis=0)
-    return float(np.linalg.norm(diffs, axis=1).sum())
-
-
-def should_run_inference(state: dict) -> bool:
-    """
-    True si buffer plein, stride atteint, cooldown terminé ET mouvement suffisant.
-
-    Si le mouvement est insuffisant, réinitialise la dédup : cela évite les
-    confirmations différées où une prédiction ancienne se combine avec une
-    nouvelle pour former une fausse concordance après une pause.
-    """
-    if len(state["buffer"]) < SEQUENCE_LENGTH:
-        return False
-    if state["stride_counter"] < INFERENCE_STRIDE:
-        return False
-
-    state["stride_counter"] = 0
-
-    if state["cooldown_counter"] > 0:
-        return False
-
-    if _window_movement(state) < MOVEMENT_THRESHOLD:
-        state["last_predictions"].clear()
-        logger.debug("Mouvement insuffisant — dédup réinitialisée")
-        return False
-
-    return True
-
-
-def run_inference(
-    model: nn.Module,
+def _infer_capture(
     state: dict,
+    model: nn.Module,
     label_map: dict[str, int],
     device: torch.device,
-) -> tuple[str, float, float, float, list[tuple[str, float]]] | None:
+) -> dict | None:
     """
-    Lance l'inférence CNN sur les 64 frames du buffer.
+    Lance une inférence sur les frames capturées et retourne un dict résultat.
 
     Returns:
-        (label, confidence, uncertainty, margin, top3) ou None si buffer incomplet.
-        - confidence  : probabilité softmax du meilleur label (0–1)
-        - uncertainty : entropie normalisée (0=certain, 1=aléatoire total)
-        - margin      : écart top1 - top2 (0–1) — proche de 0 = ambigu
-        - top3        : liste des 3 meilleures prédictions [(label, prob), ...]
+        {
+            "label":      str | None,   # None si rejeté (sous le seuil)
+            "best_label": str,          # meilleur label quoi qu'il arrive (affichage)
+            "confidence": float,        # softmax du meilleur label
+            "accepted":   bool,         # confidence >= seuil
+            "top3":       [(label, prob), ...],
+        }
+        ou None si la capture est trop courte.
     """
-    if len(state["buffer"]) < SEQUENCE_LENGTH:
+    if len(state["capture"]) < 2:
         return None
 
-    raw = np.stack(list(state["buffer"]))    # (64, 318)
-    frames = build_feature_vector(raw)        # (64, 320)
-
+    raw = np.stack(state["capture"])        # (N, 318)
+    frames = build_feature_vector(raw)       # (64, 320) — même preprocessing qu'à l'entraînement
     x = torch.tensor(frames, dtype=torch.float32).unsqueeze(0).to(device)
 
     model.eval()
     with torch.no_grad():
-        logits = model(x)
-        probs = torch.softmax(logits, dim=1)[0]
+        probs = torch.softmax(model(x), dim=1)[0]
 
-    sorted_probs, sorted_indices = probs.sort(descending=True)
-    best_idx = int(sorted_indices[0])
-    confidence = float(sorted_probs[0])
-    margin = float(sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else 1.0
-
-    p = probs.cpu().numpy().astype(np.float64)
-    entropy = -float(np.sum(p * np.log(p + 1e-9)))
-    uncertainty = entropy / math.log(len(p))
-
+    sorted_probs, sorted_idx = probs.sort(descending=True)
     idx_to_label = {v: k for k, v in label_map.items()}
-    label = idx_to_label.get(best_idx, f"classe_{best_idx}")
+    best_label = idx_to_label.get(int(sorted_idx[0]), f"classe_{int(sorted_idx[0])}")
+    confidence = float(sorted_probs[0])
+    accepted = confidence >= state["confidence_threshold"]
 
     top3 = [
-        (idx_to_label.get(int(sorted_indices[i]), f"cls_{i}"), float(sorted_probs[i]))
-        for i in range(min(3, len(sorted_indices)))
+        (idx_to_label.get(int(sorted_idx[i]), f"cls_{i}"), float(sorted_probs[i]))
+        for i in range(min(3, len(sorted_idx)))
     ]
 
-    return label, confidence, uncertainty, margin, top3
+    return {
+        "label": best_label if accepted else None,
+        "best_label": best_label,
+        "confidence": confidence,
+        "accepted": accepted,
+        "top3": top3,
+    }
 
 
-def deduplicate(
+def step_cadence(
     state: dict,
-    label: str,
-    confidence: float,
-    uncertainty: float,
-    margin: float,
-    threshold: float = CONFIDENCE_THRESHOLD,
-) -> str | None:
+    frame_features: np.ndarray,
+    model: nn.Module,
+    label_map: dict[str, int],
+    device: torch.device,
+) -> tuple[dict, str | None]:
     """
-    Confirme un signe après DEDUP_COUNT prédictions consécutives de qualité.
+    Fait avancer la machine à états d'une frame.
 
-    Une prédiction est acceptée dans la dédup si toutes ces conditions sont vraies :
-    - confidence > threshold     (softmax dominant suffisant)
-    - uncertainty < UNCERTAINTY_GATE (entropie basse — modèle sûr du label)
-    - margin > CONFIDENCE_MARGIN (top1 nettement au-dessus de top2)
+    À appeler une fois par frame webcam. Gère l'enregistrement pendant CAPTURE,
+    déclenche l'inférence à la fin de CAPTURE, et enchaîne les phases.
 
-    Si une prédiction échoue, le compteur est réinitialisé : mieux vaut exiger
-    N prédictions consécutives propres que tolérer du bruit entre elles.
-
-    Après confirmation :
-    - buffer vidé (les frames du signe ne sont plus réutilisées)
-    - cooldown activé (inférence suspendue COOLDOWN_FRAMES frames)
+    Returns:
+        (status, just_confirmed) :
+          status         : dict décrivant l'état courant pour l'affichage
+                           (voir _build_status).
+          just_confirmed : slug du signe si un signe vient d'être CONFIRMÉ à
+                           cette frame (à ajouter à la phrase), sinon None.
     """
-    quality_ok = (
-        confidence > threshold
-        and uncertainty < UNCERTAINTY_GATE
-        and margin > CONFIDENCE_MARGIN
-    )
+    state["frame_in_phase"] += 1
+    phase = state["phase"]
+    just_confirmed: str | None = None
 
-    if not quality_ok:
-        state["last_predictions"].clear()
-        return None
+    # Enregistrement des frames pendant la capture
+    if phase == PHASE_CAPTURE:
+        state["capture"].append(frame_features.astype(np.float32))
 
-    state["last_predictions"].append((label, confidence))
+    # Fin de phase atteinte ?
+    if state["frame_in_phase"] >= state["durations"][phase]:
+        if phase == PHASE_CAPTURE:
+            result = _infer_capture(state, model, label_map, device)
+            state["result"] = result
+            if result is not None and result["accepted"]:
+                just_confirmed = result["label"]
+                logger.info("Signe confirmé : %s (conf=%.2f)", result["label"], result["confidence"])
+            elif result is not None:
+                logger.info("Non reconnu (best=%s, conf=%.2f)", result["best_label"], result["confidence"])
+        _enter_phase(state, _NEXT_PHASE[phase])
 
-    if len(state["last_predictions"]) < DEDUP_COUNT:
-        return None
-
-    labels = [p[0] for p in state["last_predictions"]]
-    if len(set(labels)) != 1:
-        state["last_predictions"].clear()
-        return None
-
-    # Confirmation — réinitialise tout pour le prochain signe
-    state["last_predictions"].clear()
-    state["buffer"].clear()
-    state["cooldown_counter"] = COOLDOWN_FRAMES
-    return label
+    return _build_status(state), just_confirmed
 
 
-def get_dedup_progress(state: dict) -> tuple[int, str | None, int]:
-    """
-    Retourne (n_consécutifs, dernier_label, cooldown_restant).
+def _build_status(state: dict) -> dict:
+    """Construit le dict d'état destiné à l'affichage (overlay)."""
+    phase = state["phase"]
+    dur = state["durations"][phase]
+    elapsed = state["frame_in_phase"]
+    progress = min(1.0, elapsed / dur) if dur > 0 else 1.0
 
-    n_consécutifs : nombre de prédictions identiques depuis la plus récente.
-    cooldown_restant : frames avant la prochaine inférence (0 = prêt).
-    Utilisé pour l'affichage des points de progression et du flash de confirmation.
-    """
-    preds = list(state["last_predictions"])
-    cooldown = state["cooldown_counter"]
+    # Décompte 3-2-1 pendant PREPARE
+    countdown: int | None = None
+    if phase == PHASE_PREPARE:
+        remaining = dur - elapsed
+        countdown = max(1, math.ceil(remaining / (dur / 3.0))) if dur > 0 else 1
 
-    if not preds:
-        return 0, None, cooldown
-
-    last_label = preds[-1][0]
-    count = 0
-    for lbl, _ in reversed(preds):
-        if lbl == last_label:
-            count += 1
-        else:
-            break
-    return count, last_label, cooldown
+    return {
+        "phase": phase,
+        "progress": progress,
+        "countdown": countdown,
+        "captured": len(state["capture"]),
+        "capture_target": state["durations"][PHASE_CAPTURE],
+        "result": state["result"],
+    }

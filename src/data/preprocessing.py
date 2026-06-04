@@ -38,6 +38,18 @@ _FACE_END = 318
 
 SEQUENCE_LENGTH = 64
 
+# Indices des landmarks d'épaules dans la pose MediaPipe (33 landmarks).
+# Utilisés comme repère corporel pour la normalisation géométrique.
+_LEFT_SHOULDER_IDX = 11
+_RIGHT_SHOULDER_IDX = 12
+
+# Visibilité minimale d'un landmark pose pour qu'il serve d'ancre fiable.
+_SHOULDER_MIN_VIS = 0.2
+
+# Largeur d'épaules plancher (en unités normalisées [0,1]) pour éviter une
+# division par ~0 quand le signeur est de profil ou mal détecté.
+_MIN_SHOULDER_WIDTH = 0.05
+
 
 # ---------------------------------------------------------------------------
 # Fonctions utilitaires internes
@@ -196,6 +208,100 @@ def trim_rest_frames(
     return resample_sequence(trimmed, SEQUENCE_LENGTH)
 
 
+def _shoulder_anchor_scale(pose: np.ndarray) -> tuple[np.ndarray, float]:
+    """
+    Calcule l'ancre de recentrage (milieu des épaules par frame) et l'échelle
+    (largeur d'épaules, médiane sur la séquence) à partir de la pose.
+
+    Le repère épaules est utilisé car ces deux landmarks sont stables et
+    bien détectés ; ils définissent un référentiel corporel invariant à la
+    position du signeur dans le cadre et à sa distance à la caméra.
+
+    Args:
+        pose: shape (64, 132) — 33 landmarks × (x, y, z, vis).
+
+    Returns:
+        (anchor_xy, scale) :
+          anchor_xy : shape (64, 2) — milieu des épaules (x, y) par frame.
+          scale     : scalaire — largeur d'épaules médiane (planchée).
+    """
+    pose_lm = pose.reshape(pose.shape[0], 33, 4)        # (64, 33, 4)
+    left = pose_lm[:, _LEFT_SHOULDER_IDX]                # (64, 4)
+    right = pose_lm[:, _RIGHT_SHOULDER_IDX]              # (64, 4)
+
+    mid_xy = (left[:, :2] + right[:, :2]) / 2.0          # (64, 2)
+
+    # Largeur d'épaules par frame, restreinte aux frames où les deux épaules
+    # sont suffisamment visibles (sinon la valeur est ignorée pour la médiane).
+    width = np.linalg.norm(left[:, :2] - right[:, :2], axis=1)   # (64,)
+    visible = (left[:, 3] > _SHOULDER_MIN_VIS) & (right[:, 3] > _SHOULDER_MIN_VIS)
+    valid_widths = width[visible]
+
+    if valid_widths.size > 0:
+        scale = float(np.median(valid_widths))
+    else:
+        # Pose non fiable : échelle neutre, l'invariance d'échelle est perdue
+        # mais on évite une division aberrante.
+        scale = 1.0
+    scale = max(scale, _MIN_SHOULDER_WIDTH)
+
+    return mid_xy.astype(np.float32), scale
+
+
+def normalize_geometry(
+    pose: np.ndarray,
+    dominant: np.ndarray,
+    passive: np.ndarray,
+    face: np.ndarray,
+    dom_flags: np.ndarray,
+    pas_flags: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Normalisation corps-relative PAR FRAME (remplace l'ancien z-score par feature).
+
+    Chaque frame est recentrée sur le milieu de ses épaules et mise à l'échelle
+    par la largeur d'épaules de la séquence. Résultat : coordonnées exprimées en
+    « largeurs d'épaules » autour du torse, invariantes à la position et à la
+    taille apparente du signeur — ce qui aide la généralisation à un nouveau
+    signeur (cf. split par contributeur).
+
+    - x, y : recentrés (ancre) puis divisés par l'échelle.
+    - z     : divisé par l'échelle (profondeur relative), pas de recentrage.
+    - vis (pose) et 4e colonne face : inchangés.
+    - Les mains absentes (flag=0) restent exactement à 0 pour rester cohérentes
+      avec les flags de présence.
+
+    Args:
+        pose:      (64, 132)   dominant/passive: (64, 63)   face: (64, 60)
+        dom_flags, pas_flags: (64,) — 1.0 si la main est présente sur la frame.
+
+    Returns:
+        (pose, dominant, passive, face) normalisés, mêmes shapes.
+    """
+    anchor, scale = _shoulder_anchor_scale(pose)   # (64,2), scalaire
+    ax = anchor[:, 0:1]   # (64,1) — broadcast sur les landmarks
+    ay = anchor[:, 1:2]
+
+    def _norm_xyz(block: np.ndarray, n_lm: int, stride: int) -> np.ndarray:
+        """Recentre/échelle les x,y,z d'un bloc (64, n_lm*stride), garde les autres colonnes."""
+        out = block.reshape(block.shape[0], n_lm, stride).copy()
+        out[:, :, 0] = (out[:, :, 0] - ax) / scale   # x
+        out[:, :, 1] = (out[:, :, 1] - ay) / scale   # y
+        out[:, :, 2] = out[:, :, 2] / scale          # z (relatif)
+        return out.reshape(block.shape[0], n_lm * stride)
+
+    pose_n = _norm_xyz(pose, 33, 4)   # vis (col 3) laissée intacte par _norm_xyz
+    face_n = _norm_xyz(face, 15, 4)   # 4e colonne (0.0) laissée intacte
+    dom_n = _norm_xyz(dominant, 21, 3)
+    pas_n = _norm_xyz(passive, 21, 3)
+
+    # Réimpose les zéros sur les mains absentes (le recentrage les avait décalées)
+    dom_n[dom_flags == 0.0] = 0.0
+    pas_n[pas_flags == 0.0] = 0.0
+
+    return pose_n, dom_n, pas_n, face_n
+
+
 def build_feature_vector(frames: np.ndarray) -> np.ndarray:
     """
     Construit le vecteur feature normalisé à partir d'un sample brut.
@@ -204,8 +310,8 @@ def build_feature_vector(frames: np.ndarray) -> np.ndarray:
       1. Trim des frames de repos (début/fin)
       2. Détection de la main dominante par mouvement
       3. Calcul des flags de présence
-      4. Reconstruction : pose(132) + dominant(63) + passive(63) + face(60) + flags(2)
-      5. Z-score par feature sur les 64 frames (instance normalization)
+      4. Normalisation géométrique corps-relative par frame (épaules)
+      5. Reconstruction : pose(132) + dominant(63) + passive(63) + face(60) + flags(2)
 
     Args:
         frames: shape (64, 318) — sample brut issu du loader.
@@ -221,6 +327,12 @@ def build_feature_vector(frames: np.ndarray) -> np.ndarray:
     dominant, passive = detect_dominant_hand(frames)  # (64, 63) chacun
     dom_flags, pas_flags = add_presence_flags(dominant, passive)  # (64,) chacun
 
+    # Normalisation géométrique corps-relative (remplace le z-score par feature).
+    # Les flags binaires 0/1 ne sont PAS normalisés : leur sémantique est conservée.
+    pose, dominant, passive, face = normalize_geometry(
+        pose, dominant, passive, face, dom_flags, pas_flags
+    )
+
     # Concatène dans l'ordre final : pose + dominant + passive + face + flags
     feature = np.concatenate([
         pose,
@@ -230,13 +342,6 @@ def build_feature_vector(frames: np.ndarray) -> np.ndarray:
         dom_flags[:, np.newaxis],   # (64, 1)
         pas_flags[:, np.newaxis],   # (64, 1)
     ], axis=1)  # (64, 320)
-
-    # Z-score par feature sur la séquence (instance normalization)
-    # std=1 si std≈0 pour éviter la division par zéro sur les features constantes
-    mean = feature.mean(axis=0)          # (320,)
-    std = feature.std(axis=0)            # (320,)
-    std = np.where(std < 1e-6, 1.0, std)
-    feature = (feature - mean) / std
 
     return feature.astype(np.float32)
 

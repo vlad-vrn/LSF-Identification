@@ -10,9 +10,6 @@ __pycache__/
 *.pyd
 .Python
 
-# Dataset — ne pas versionner les données brutes
-dataset/
-
 # Modèles entraînés — binaires lourds
 models/*.pt
 models/*.pth

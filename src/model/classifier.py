@@ -33,7 +33,7 @@ class LSFClassifier(nn.Module):
     - Dropout porté à 0.4 pour compenser l'expressivité accrue du 3e bloc.
     """
 
-    def __init__(self, n_classes: int) -> None:
+    def __init__(self, n_classes: int, dropout: float = _DROPOUT) -> None:
         super().__init__()
         self.n_classes = n_classes
 
@@ -49,7 +49,7 @@ class LSFClassifier(nn.Module):
             nn.Linear(_CHANNELS[2], _FC_HIDDEN),
             nn.LayerNorm(_FC_HIDDEN),
             nn.ReLU(),
-            nn.Dropout(_DROPOUT),
+            nn.Dropout(dropout),
             nn.Linear(_FC_HIDDEN, n_classes),
         )
 
@@ -78,8 +78,8 @@ class LSFClassifier(nn.Module):
         return self.head(x)       # (B, n_classes)
 
 
-def make_classifier(n_classes: int) -> LSFClassifier:
-    return LSFClassifier(n_classes=n_classes)
+def make_classifier(n_classes: int, dropout: float = _DROPOUT) -> LSFClassifier:
+    return LSFClassifier(n_classes=n_classes, dropout=dropout)
 
 
 if __name__ == "__main__":

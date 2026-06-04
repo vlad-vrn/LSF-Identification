@@ -24,6 +24,15 @@ from model.train import N_EPOCHS, LR, train
 ALLOWED_SIGNS: list[str] | None = None
 
 
+def _signs_with_min_contrib(samples: list[dict], min_contrib: int) -> list[str]:
+    """Slugs des signes ayant au moins min_contrib contributeurs distincts."""
+    from collections import defaultdict
+    contrib: dict[str, set] = defaultdict(set)
+    for s in samples:
+        contrib[s["label"]].add(s["contributor_id"])
+    return sorted(slug for slug, ids in contrib.items() if len(ids) >= min_contrib)
+
+
 def _filter_samples(
     samples: list[dict],
     allowed: list[str],
@@ -75,6 +84,18 @@ def parse_args() -> argparse.Namespace:
         default="models/lsf_v1.pt",
         help="Chemin de sauvegarde du modèle (défaut : models/lsf_v1.pt)",
     )
+    parser.add_argument(
+        "--min-contrib-keep",
+        type=int,
+        default=0,
+        help="Ne garder que les classes ayant >= N contributeurs (0 = toutes)",
+    )
+    parser.add_argument(
+        "--exclude",
+        nargs="+",
+        default=[],
+        help="Slugs de signes à exclure de l'entraînement (ex: --exclude manger)",
+    )
     return parser.parse_args()
 
 
@@ -95,8 +116,19 @@ def main() -> None:
     logging.info("Chargement du dataset depuis %s", dataset_path)
     samples = load_dataset(dataset_path)
 
-    if ALLOWED_SIGNS is not None:
-        samples, label_map = _filter_samples(samples, ALLOWED_SIGNS)
+    # Priorité : --min-contrib-keep > ALLOWED_SIGNS > toutes les classes
+    allowed = ALLOWED_SIGNS
+    if args.min_contrib_keep > 0:
+        allowed = _signs_with_min_contrib(samples, args.min_contrib_keep)
+
+    # Exclusion explicite de certains signes (appliquée après le filtre contrib)
+    if args.exclude:
+        base = allowed if allowed is not None else sorted({s["label"] for s in samples})
+        allowed = [slug for slug in base if slug not in set(args.exclude)]
+        logging.info("Exclusion demandée : %s", args.exclude)
+
+    if allowed is not None:
+        samples, label_map = _filter_samples(samples, allowed)
         logging.info("Filtre actif — %d signes retenus : %s", len(label_map), sorted(label_map))
     else:
         label_map = get_label_map(dataset_path)
