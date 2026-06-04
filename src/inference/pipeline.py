@@ -196,6 +196,15 @@ def step_cadence(
     return _build_status(state), just_confirmed
 
 
+def current_status(state: dict) -> dict:
+    """Retourne le status d'affichage courant SANS faire avancer la machine.
+
+    Utile quand la détection est en pause (génération de phrase) : on continue
+    d'afficher le dernier état sans capturer ni inférer.
+    """
+    return _build_status(state)
+
+
 def _build_status(state: dict) -> dict:
     """Construit le dict d'état destiné à l'affichage (overlay)."""
     phase = state["phase"]

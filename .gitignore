@@ -3,19 +3,27 @@
 venv/
 env/
 
+# Secrets / config locale — NE JAMAIS committer (contient les clés API)
+.env
+.env.local
+!.env.example
+
+# Données brutes — ne pas versionner (cf. CLAUDE.md)
+src/data/approved/
+dataset/
+
+# Modèles entraînés (binaires) — ignorer les .pt sauf le modèle de déploiement
+models/*.pt
+models/*.pth
+!models/lsf_v1.pt
+# label_map.json est versionné (petit, utile pour l'inférence)
+
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
-
-# Modèles entraînés — binaires lourds
-models/*.pt
-models/*.pth
-# label_map.json est versionné (petit, utile pour l'inférence)
-!models/label_map.json
-!models/.gitkeep
 
 # Jupyter
 .ipynb_checkpoints/

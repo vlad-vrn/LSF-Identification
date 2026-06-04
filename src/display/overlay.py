@@ -49,6 +49,7 @@ def draw_overlay(
     phrase: list[str],
     constructed_sentence: str | None = None,
     sentence_building: bool = False,
+    paused: bool = False,
 ) -> np.ndarray:
     """
     Dessine l'interface complète sur la frame.
@@ -60,14 +61,25 @@ def draw_overlay(
         phrase:   liste des signes confirmés.
         constructed_sentence: phrase NLP reconstruite, ou None.
         sentence_building:    True si la construction NLP est en cours.
+        paused:   True si la détection est en pause (génération de phrase).
     """
     out = frame.copy()
     h, w = out.shape[:2]
+    y0 = h - _PANEL_H
+
+    if paused:
+        _draw_paused_cue(out, sentence_building, w, h)
+        _draw_panel_bg(out, y0, w)
+        _draw_paused_banner(out, sentence_building, y0, w)
+        cv2.line(out, (12, y0 + 96), (w - 12, y0 + 96), (55, 55, 55), 1)
+        _draw_signs_phrase(out, phrase, y0, w)
+        _draw_nlp_row(out, constructed_sentence, sentence_building, y0, w)
+        _draw_resume_hint(out, y0, w)
+        return out
 
     _draw_phase_progress_bar(out, status, w)
     _draw_center_cue(out, status, w, h)
 
-    y0 = h - _PANEL_H
     _draw_panel_bg(out, y0, w)
     _draw_phase_banner(out, status, y0, w)
     _draw_result_or_capture(out, status, y0, w)
@@ -76,6 +88,26 @@ def draw_overlay(
     _draw_nlp_row(out, constructed_sentence, sentence_building, y0, w)
     _draw_hints(out, y0, w)
     return out
+
+
+def _draw_paused_cue(frame: np.ndarray, building: bool, w: int, h: int) -> None:
+    """Repère central en pause : construction en cours ou phrase prête."""
+    cx, cy = w // 2, h // 2 - 40
+    txt = "GENERATION..." if building else "DETECTION EN PAUSE"
+    color = _ORANGE if building else _CYAN
+    scale, thick = 1.4, 3
+    (tw, th), _ = cv2.getTextSize(txt, _FONT, scale, thick)
+    cv2.putText(frame, txt, (cx - tw // 2, cy + th // 2), _FONT, scale, color, thick, cv2.LINE_AA)
+
+
+def _draw_paused_banner(frame: np.ndarray, building: bool, y0: int, w: int) -> None:
+    label = "GENERATION DE LA PHRASE..." if building else "EN PAUSE"
+    cv2.putText(frame, label, (14, y0 + 30), _FONT, 0.8, _CYAN, 2, cv2.LINE_AA)
+
+
+def _draw_resume_hint(frame: np.ndarray, y0: int, w: int) -> None:
+    cv2.putText(frame, "ESPACE : reprendre la detection      C : effacer      Q : quitter",
+                (14, y0 + _PANEL_H - 10), _FONT, 0.37, (90, 90, 90), 1, cv2.LINE_AA)
 
 
 # ── Indicateurs visuels ────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ Raccourcis :
 
 import argparse
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -29,6 +30,32 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+_PROJECT_ROOT = Path(__file__).parent.parent
+
+
+def load_dotenv(path: Path) -> None:
+    """
+    Charge un fichier .env (KEY=VALUE par ligne) dans os.environ.
+
+    Loader minimal sans dépendance : ignore lignes vides et commentaires (#),
+    retire les guillemets autour des valeurs. Les variables déjà présentes dans
+    l'environnement ont la priorité (un export shell explicite l'emporte sur .env).
+    """
+    if not path.exists():
+        return
+    # utf-8-sig : retire un éventuel BOM (PowerShell écrit du UTF-8 avec BOM),
+    # sinon la première variable du fichier serait corrompue (﻿KEY).
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 from display.overlay import draw_overlay
 from inference.mediapipe_extractor import make_holistic, process_frame
 from inference.pipeline import (
@@ -37,6 +64,7 @@ from inference.pipeline import (
     PREPARE_FRAMES,
     REST_FRAMES,
     RESULT_FRAMES,
+    current_status,
     make_cadence_state,
     step_cadence,
 )
@@ -63,7 +91,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rest-frames", type=int, default=REST_FRAMES,
                         help=f"Durée de la pause (défaut : {REST_FRAMES})")
     parser.add_argument("--api-key", default=None, dest="api_key",
-                        help="Clé API Anthropic (sinon : variable ANTHROPIC_API_KEY)")
+                        help="Clé API NLP (sinon : LSF_NLP_API_KEY ou ANTHROPIC_API_KEY)")
+    parser.add_argument("--nlp-provider", default=None, choices=["anthropic", "openai"],
+                        dest="nlp_provider",
+                        help="Backend NLP : 'openai' pour nouslabs/compatible OpenAI, "
+                             "'anthropic' pour Claude (défaut : auto selon --nlp-base-url)")
+    parser.add_argument("--nlp-base-url", default=None, dest="nlp_base_url",
+                        help="URL de base OpenAI-compatible (ex: nouslabs), termine par /v1")
+    parser.add_argument("--nlp-model", default=None, dest="nlp_model",
+                        help="ID du modèle NLP (selon ton provider)")
     return parser.parse_args()
 
 
@@ -79,6 +115,9 @@ def load_model(
 
 
 def main() -> None:
+    # Charge .env à la racine du projet avant tout (clés API, config NLP)
+    load_dotenv(_PROJECT_ROOT / ".env")
+
     args = parse_args()
 
     logging.basicConfig(
@@ -118,10 +157,13 @@ def main() -> None:
     )
     phrase: list[str] = []
 
+    # Détection en pause pendant la génération de phrase (et jusqu'à reprise).
+    paused: bool = False
+
     # ── État NLP (partagé avec le thread de construction) ────────────────
     nlp: dict = {"building": False, "sentence": None}
 
-    logging.info("Démarré (mode cadencé) — Q=quitter  C=effacer  S=construire phrase")
+    logging.info("Démarré (mode cadencé) — S=construire (met en pause)  ESPACE=reprendre  C=effacer  Q=quitter")
 
     with make_holistic() as holistic:
         while True:
@@ -131,11 +173,16 @@ def main() -> None:
                 break
 
             keypoints, annotated = process_frame(frame_bgr, holistic)
-            status, just_confirmed = step_cadence(state, keypoints, model, label_map, device)
 
-            if just_confirmed is not None:
-                phrase.append(just_confirmed)
-                nlp["sentence"] = None   # invalide la phrase NLP précédente
+            # En pause : on n'avance plus la cadence (ni capture, ni inférence),
+            # on fige le dernier état affiché.
+            if paused:
+                status = current_status(state)
+            else:
+                status, just_confirmed = step_cadence(state, keypoints, model, label_map, device)
+                if just_confirmed is not None:
+                    phrase.append(just_confirmed)
+                    nlp["sentence"] = None   # invalide la phrase NLP précédente
 
             # ── Redimensionnement pour l'affichage ───────────────────────
             h_orig, w_orig = annotated.shape[:2]
@@ -149,6 +196,7 @@ def main() -> None:
                 phrase=phrase,
                 constructed_sentence=nlp["sentence"],
                 sentence_building=nlp["building"],
+                paused=paused,
             )
 
             cv2.imshow("LSF Recognition", display)
@@ -162,22 +210,43 @@ def main() -> None:
                 nlp["sentence"] = None
                 logging.info("Phrase effacée.")
 
+            elif key == ord(" "):
+                # Reprise de la détection après une génération
+                if paused:
+                    paused = False
+                    state = make_cadence_state(
+                        prepare_frames=args.prepare_frames,
+                        capture_frames=args.capture_frames,
+                        result_frames=args.result_frames,
+                        rest_frames=args.rest_frames,
+                        confidence_threshold=args.confidence,
+                    )
+                    logging.info("Détection reprise.")
+
             elif key == ord("s"):
                 if nlp["building"]:
                     logging.info("Construction déjà en cours.")
                 elif not phrase:
                     logging.info("Aucun signe à construire.")
                 else:
+                    # Met la détection en pause pendant la génération
+                    paused = True
                     snapshot = phrase.copy()
                     nlp["building"] = True
                     nlp["sentence"] = None
 
-                    def _build(signs: list[str], api_key: str | None) -> None:
-                        nlp["sentence"] = build_sentence(signs, api_key)
+                    def _build(signs: list[str]) -> None:
+                        nlp["sentence"] = build_sentence(
+                            signs,
+                            api_key=args.api_key,
+                            provider=args.nlp_provider,
+                            base_url=args.nlp_base_url,
+                            model=args.nlp_model,
+                        )
                         nlp["building"] = False
 
-                    threading.Thread(target=_build, args=(snapshot, args.api_key), daemon=True).start()
-                    logging.info("Construction NLP démarrée : %s", snapshot)
+                    threading.Thread(target=_build, args=(snapshot,), daemon=True).start()
+                    logging.info("Construction NLP démarrée (détection en pause) : %s", snapshot)
 
     cap.release()
     cv2.destroyAllWindows()

@@ -1,0 +1,9 @@
+# Dépendances du backend web (inférence uniquement — léger).
+# Pas de mediapipe / opencv / pandas : le preprocessing est en numpy pur,
+# et la capture + MediaPipe se font côté navigateur.
+fastapi
+uvicorn[standard]
+numpy
+# PyTorch CPU : installé via l'index CPU dans le Dockerfile
+torch
+# anthropic optionnel (uniquement si backend NLP = anthropic ; Nous utilise urllib)

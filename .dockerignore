@@ -1,0 +1,25 @@
+# Données brutes — JAMAIS dans l'image (énorme, inutile à l'inférence)
+src/data/approved/
+dataset/
+
+# Environnement & artefacts locaux
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.log
+
+# Outils d'entraînement/analyse non nécessaires au serveur
+scripts/
+notebooks/
+IMPROVE_LOG.md
+IMPROVE_PROMPT.md
+
+# Secrets & git
+.env
+.env.local
+.git/
+.gitignore
+
+# Docs
+*.md

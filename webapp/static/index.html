@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LSF · Reconnaissance en temps réel</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">✋</span>
+        <div>
+          <h1>LSF&nbsp;Direct</h1>
+          <p class="subtitle">Reconnaissance de Langue des Signes Française</p>
+        </div>
+      </div>
+      <div class="status-pill" id="connStatus"><span class="dot"></span> Chargement…</div>
+    </header>
+
+    <main class="grid">
+      <!-- Colonne vidéo -->
+      <section class="card video-card">
+        <div class="video-wrap">
+          <video id="input_video" playsinline></video>
+          <canvas id="output_canvas"></canvas>
+
+          <!-- Surimpression cadence -->
+          <div class="cue" id="cue">
+            <div class="cue-countdown" id="cueCountdown"></div>
+            <div class="cue-text" id="cueText">Appuyez sur Démarrer</div>
+          </div>
+
+          <!-- Barre de progression de phase -->
+          <div class="phasebar"><div class="phasebar-fill" id="phaseFill"></div></div>
+        </div>
+
+        <div class="controls">
+          <button class="btn btn-primary" id="startBtn">▶ Démarrer la caméra</button>
+          <button class="btn" id="generateBtn" disabled>✨ Générer la phrase</button>
+          <button class="btn" id="resumeBtn" disabled hidden>⟳ Reprendre</button>
+          <button class="btn btn-ghost" id="clearBtn">🗑 Effacer</button>
+        </div>
+
+        <div class="threshold">
+          <label for="thr">Seuil de confiance : <strong id="thrVal">10%</strong></label>
+          <input type="range" id="thr" min="0" max="90" value="10" step="5" />
+        </div>
+      </section>
+
+      <!-- Colonne résultats -->
+      <aside class="card side">
+        <div class="phase-banner" id="phaseBanner">EN ATTENTE</div>
+
+        <div class="result-box" id="resultBox">
+          <div class="result-label" id="resultLabel">—</div>
+          <div class="result-conf" id="resultConf"></div>
+          <div class="result-alts" id="resultAlts"></div>
+        </div>
+
+        <div class="block">
+          <h3>Signes détectés</h3>
+          <div class="chips" id="chips"><span class="empty">aucun signe pour l'instant</span></div>
+        </div>
+
+        <div class="block">
+          <h3>Phrase reconstruite</h3>
+          <div class="sentence" id="sentence"><span class="empty">— appuyez sur « Générer la phrase »</span></div>
+        </div>
+
+        <div class="legend">
+          <h3>Signes reconnus (<span id="nClasses">0</span>)</h3>
+          <div class="legend-list" id="legendList"></div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="foot">
+      <span>Modèle 1D-CNN · capture cadencée · MediaPipe Holistic</span>
+      <span id="fps"></span>
+    </footer>
+  </div>
+
+  <!-- MediaPipe (navigateur) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js" crossorigin="anonymous"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
